@@ -20326,11 +20326,11 @@ static void check_pmtud_blackhole(enum pmtud_blackhole_case test_case) {
     server_default_remote_transport_params(&remote_params);
     remote_params.initial_max_streams_bidi = 1;
     setup_default_server_with_options(
-      &conn, (conn_options){.settings = &settings,
-                            .remote_params = &remote_params});
+      &conn,
+      (conn_options){.settings = &settings, .remote_params = &remote_params});
   } else {
-    setup_default_client_with_options(
-      &conn, (conn_options){.settings = &settings});
+    setup_default_client_with_options(&conn,
+                                      (conn_options){.settings = &settings});
   }
   ngtcp2_tpe_init_conn(&tpe, conn);
   rv = ngtcp2_conn_start_pmtud(conn);
@@ -20371,15 +20371,15 @@ static void check_pmtud_blackhole(enum pmtud_blackhole_case test_case) {
     break;
   }
   confirmed = ngtcp2_conn_get_path_max_tx_udp_payload_size2(conn);
-  expected = test_case == PMTUD_BLACKHOLE_CLIENT ||
-                 test_case == PMTUD_BLACKHOLE_SERVER
-               ? NGTCP2_MAX_UDP_PAYLOAD_SIZE
-               : confirmed;
+  expected =
+    test_case == PMTUD_BLACKHOLE_CLIENT || test_case == PMTUD_BLACKHOLE_SERVER
+      ? NGTCP2_MAX_UDP_PAYLOAD_SIZE
+      : confirmed;
   rv = ngtcp2_conn_open_bidi_stream(conn, &stream_id, NULL);
   assert_int(0, ==, rv);
-  nwrite = ngtcp2_conn_writev_stream(
-    conn, NULL, NULL, buf, sizeof(buf), &ndatalen,
-    NGTCP2_WRITE_STREAM_FLAG_NONE, stream_id, &vec, 1, ++t);
+  nwrite = ngtcp2_conn_writev_stream(conn, NULL, NULL, buf, sizeof(buf),
+                                     &ndatalen, NGTCP2_WRITE_STREAM_FLAG_NONE,
+                                     stream_id, &vec, 1, ++t);
   assert_ptrdiff(0, <, nwrite);
   if (test_case != PMTUD_BLACKHOLE_BASE_SIZE) {
     assert_ptrdiff(1280, <, nwrite);
@@ -20390,8 +20390,8 @@ static void check_pmtud_blackhole(enum pmtud_blackhole_case test_case) {
        PTO can then be cancelled before handshake confirmation. */
     conn->flags &= ~NGTCP2_CONN_FLAG_HANDSHAKE_CONFIRMED;
     conn->cstat.pto_count = 2;
-    rv = ngtcp2_conn_on_loss_detection_timer(
-      conn, conn->cstat.loss_detection_timer);
+    rv = ngtcp2_conn_on_loss_detection_timer(conn,
+                                             conn->cstat.loss_detection_timer);
     assert_int(0, ==, rv);
     assert_size(confirmed, ==,
                 ngtcp2_conn_get_path_max_tx_udp_payload_size2(conn));
@@ -20418,7 +20418,8 @@ static void check_pmtud_blackhole(enum pmtud_blackhole_case test_case) {
   }
   assert_uint64(test_case == PMTUD_BLACKHOLE_ACK_RESET ? 2 : 3, ==,
                 conn->cstat.pto_count);
-  assert_size(expected, ==, ngtcp2_conn_get_path_max_tx_udp_payload_size2(conn));
+  assert_size(expected, ==,
+              ngtcp2_conn_get_path_max_tx_udp_payload_size2(conn));
   assert_size(expected, ==, conn->cstat.max_tx_udp_payload_size);
   if (expected == NGTCP2_MAX_UDP_PAYLOAD_SIZE) {
     assert_ptrdiff(NGTCP2_MAX_UDP_PAYLOAD_SIZE, >=, nwrite);
@@ -20434,7 +20435,8 @@ static void check_pmtud_blackhole(enum pmtud_blackhole_case test_case) {
   assert_int(0, ==, rv);
   assert_uint64(0, ==, conn->cstat.pto_count);
   assert_int(NGTCP2_CS_POST_HANDSHAKE, ==, conn->state);
-  assert_size(expected, ==, ngtcp2_conn_get_path_max_tx_udp_payload_size2(conn));
+  assert_size(expected, ==,
+              ngtcp2_conn_get_path_max_tx_udp_payload_size2(conn));
   assert_null(conn->pmtud);
   ngtcp2_conn_del(conn);
 }
@@ -20468,14 +20470,13 @@ void test_ngtcp2_conn_pmtud_blackhole_ack_reset(void) {
 }
 
 /* Connection-level regressions: all ACKs go through encoded 1-RTT packets. */
-static void pmtud_v2_ack(ngtcp2_conn *conn, ngtcp2_tpe *tpe,
-                         int64_t pkt_num, ngtcp2_tstamp *ts) {
+static void pmtud_v2_ack(ngtcp2_conn *conn, ngtcp2_tpe *tpe, int64_t pkt_num,
+                         ngtcp2_tstamp *ts) {
   uint8_t buf[2048];
-  ngtcp2_frame fr = {.ack = {.type = NGTCP2_FRAME_ACK,
-                            .largest_ack = pkt_num}};
+  ngtcp2_frame fr = {.ack = {.type = NGTCP2_FRAME_ACK, .largest_ack = pkt_num}};
   size_t len = ngtcp2_tpe_write_1rtt(tpe, buf, sizeof(buf), &fr, 1);
-  int rv = ngtcp2_conn_read_pkt(conn, &conn->dcid.current.ps.path, NULL,
-                               buf, len, ++*ts);
+  int rv = ngtcp2_conn_read_pkt(conn, &conn->dcid.current.ps.path, NULL, buf,
+                                len, ++*ts);
   assert_int(0, ==, rv);
 }
 
@@ -20508,15 +20509,19 @@ static void pmtud_v2_setup_options(ngtcp2_conn **pconn, ngtcp2_tpe *tpe,
     local.sin6_addr.s6_addr[15] = 1;
     remote.sin6_addr.s6_addr[15] = 2;
     ngtcp2_path_storage_init(&ps, (ngtcp2_sockaddr *)&local, sizeof(local),
-                              (ngtcp2_sockaddr *)&remote, sizeof(remote), NULL);
+                             (ngtcp2_sockaddr *)&remote, sizeof(remote), NULL);
     path = &ps.path;
   }
   if (server) {
-    setup_default_server_with_options(pconn, (conn_options){
-      .settings = &settings, .remote_params = &remote_params, .path = path});
+    setup_default_server_with_options(
+      pconn, (conn_options){.settings = &settings,
+                            .remote_params = &remote_params,
+                            .path = path});
   } else {
-    setup_default_client_with_options(pconn, (conn_options){
-      .settings = &settings, .remote_params = &remote_params, .path = path});
+    setup_default_client_with_options(
+      pconn, (conn_options){.settings = &settings,
+                            .remote_params = &remote_params,
+                            .path = path});
   }
   (*pconn)->local.transport_params.max_idle_timeout = 0;
   (*pconn)->remote.transport_params->max_idle_timeout = 0;
@@ -20553,11 +20558,11 @@ static void pmtud_v2_selective(int server, int ipv6) {
   for (i = 0; i < 4; ++i) {
     ts += NGTCP2_SECONDS;
     nwrite = ngtcp2_conn_writev_stream(conn, NULL, NULL, buf, sizeof(buf),
-                                      &ndatalen, 0, stream_id, &vec, 1, ts);
+                                       &ndatalen, 0, stream_id, &vec, 1, ts);
     assert_ptrdiff(1280, <, nwrite);
     ts += NGTCP2_SECONDS;
-    nwrite = ngtcp2_conn_writev_stream(conn, NULL, NULL, buf, 1200,
-                                      &ndatalen, 0, stream_id, &small, 1, ts);
+    nwrite = ngtcp2_conn_writev_stream(conn, NULL, NULL, buf, 1200, &ndatalen,
+                                       0, stream_id, &small, 1, ts);
     assert_ptrdiff(0, <, nwrite);
     assert_ptrdiff(1200, >=, nwrite);
     /* The oversized packet is dropped; only this smaller packet is ACKed. */
@@ -20572,9 +20577,7 @@ static void pmtud_v2_selective(int server, int ipv6) {
   ngtcp2_conn_del(conn);
 }
 
-void test_ngtcp2_conn_pmtud_v2_selective(void) {
-  pmtud_v2_selective(0, 0);
-}
+void test_ngtcp2_conn_pmtud_v2_selective(void) { pmtud_v2_selective(0, 0); }
 
 void test_ngtcp2_conn_pmtud_v2_selective_server(void) {
   pmtud_v2_selective(1, 0);
@@ -20600,7 +20603,7 @@ static void pmtud_v2_silence(ngtcp2_conn *conn, ngtcp2_tstamp *ts) {
   rv = ngtcp2_conn_open_bidi_stream(conn, &stream_id, NULL);
   assert_int(0, ==, rv);
   nwrite = ngtcp2_conn_writev_stream(conn, NULL, NULL, buf, sizeof(buf),
-                                    &ndatalen, 0, stream_id, &vec, 1, ++*ts);
+                                     &ndatalen, 0, stream_id, &vec, 1, ++*ts);
   assert_ptrdiff(1280, <, nwrite);
   for (i = 0; conn->cstat.pto_count < 3 && i < 16; ++i) {
     *ts = conn->cstat.loss_detection_timer;
@@ -20706,8 +20709,8 @@ void test_ngtcp2_conn_pmtud_v2_stale_ack(void) {
   pmtud_v2_setup(&conn, &tpe, &ts);
   rv = ngtcp2_conn_open_uni_stream(conn, &stream_id, NULL);
   assert_int(0, ==, rv);
-  nwrite = ngtcp2_conn_writev_stream(conn, NULL, NULL, buf, 1200,
-                                    &ndatalen, 0, stream_id, &vec, 1, ++ts);
+  nwrite = ngtcp2_conn_writev_stream(conn, NULL, NULL, buf, 1200, &ndatalen, 0,
+                                     stream_id, &vec, 1, ++ts);
   assert_ptrdiff(0, <, nwrite);
   old_pkt_num = conn->pktns.tx.last_pkt_num;
   pmtud_v2_silence(conn, &ts);
@@ -20728,8 +20731,8 @@ void test_ngtcp2_conn_pmtud_v2_probe_ack(void) {
   pmtud_v2_setup(&conn, &tpe, &ts);
   /* A constructed history isolates feedback from a real encoded probe ACK. */
   ngtcp2_pmtud_blackhole_lost(&conn->pmtud_recovery.blackhole, 0, 1400);
-  assert_false(ngtcp2_pmtud_blackhole_detected(
-    &conn->pmtud_recovery.blackhole));
+  assert_false(
+    ngtcp2_pmtud_blackhole_detected(&conn->pmtud_recovery.blackhole));
   conn->dcid.current.max_udp_payload_size = 1406;
   conn->cstat.max_tx_udp_payload_size = 1406;
   rv = ngtcp2_conn_start_pmtud(conn);
@@ -20785,10 +20788,12 @@ void test_ngtcp2_conn_pmtud_v2_path_epoch(void) {
 
   pmtud_v2_setup(&conn, &tpe, &ts);
   ngtcp2_pmtud_blackhole_lost(&conn->pmtud_recovery.blackhole, 0, 1400);
-  assert_false(ngtcp2_pmtud_blackhole_detected(
-    &conn->pmtud_recovery.blackhole));
+  assert_false(
+    ngtcp2_pmtud_blackhole_detected(&conn->pmtud_recovery.blackhole));
   fr.new_connection_id = (ngtcp2_new_connection_id){
-    .type = NGTCP2_FRAME_NEW_CONNECTION_ID, .seq = 1, .cid = cid,
+    .type = NGTCP2_FRAME_NEW_CONNECTION_ID,
+    .seq = 1,
+    .cid = cid,
   };
   len = ngtcp2_tpe_write_1rtt(&tpe, buf, sizeof(buf), &fr, 1);
   rv = ngtcp2_conn_read_pkt(conn, &null_path.path, NULL, buf, len, ++ts);
@@ -20914,7 +20919,7 @@ void test_ngtcp2_conn_pmtud_v2_probe_then_data_pto(void) {
   rv = ngtcp2_conn_open_bidi_stream(conn, &stream_id, NULL);
   assert_int(0, ==, rv);
   nwrite = ngtcp2_conn_writev_stream(conn, NULL, NULL, buf, sizeof(buf),
-                                    &ndatalen, 0, stream_id, &vec, 1, ++ts);
+                                     &ndatalen, 0, stream_id, &vec, 1, ++ts);
   assert_ptrdiff(1200, <, nwrite);
   ts = conn->cstat.loss_detection_timer;
   rv = ngtcp2_conn_handle_expiry(conn, ts);

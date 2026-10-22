@@ -253,8 +253,7 @@ void ngtcp2_pmtud_blackhole_lost(ngtcp2_pmtud_blackhole *bh, int64_t pkt_num,
     return;
   }
 
-  if (bh->burst_first_pkt_num != -1 &&
-      pkt_num != bh->burst_first_pkt_num - 1) {
+  if (bh->burst_first_pkt_num != -1 && pkt_num != bh->burst_first_pkt_num - 1) {
     pmtud_blackhole_finish_burst(bh);
   }
   if (bh->burst_last_pkt_num == -1) {

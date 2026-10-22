@@ -5152,7 +5152,6 @@ void ngtcp2_conn_stop_pmtud(ngtcp2_conn *conn) {
   conn->pmtud = NULL;
 }
 
-
 static int conn_pmtud_recovery_enabled(const ngtcp2_conn *conn) {
   return (conn->flags & NGTCP2_CONN_FLAG_HANDSHAKE_CONFIRMED) &&
          (conn->dcid.current.flags & NGTCP2_DCID_FLAG_PATH_VALIDATED) &&
@@ -5161,7 +5160,7 @@ static int conn_pmtud_recovery_enabled(const ngtcp2_conn *conn) {
 }
 
 static ngtcp2_tstamp conn_pmtud_deadline(ngtcp2_tstamp ts,
-                                        ngtcp2_duration delay) {
+                                         ngtcp2_duration delay) {
   return ts >= UINT64_MAX - delay ? UINT64_MAX : ts + delay;
 }
 
@@ -5218,8 +5217,7 @@ static void conn_pmtud_fallback(ngtcp2_conn *conn, ngtcp2_tstamp ts) {
                   "PMTUD provisional fallback to base payload");
 }
 
-void ngtcp2_conn_pmtud_on_ack(ngtcp2_conn *conn,
-                              const ngtcp2_rtb_entry *ent,
+void ngtcp2_conn_pmtud_on_ack(ngtcp2_conn *conn, const ngtcp2_rtb_entry *ent,
                               ngtcp2_tstamp ts) {
   (void)ts;
   if (!conn_pmtud_recovery_enabled(conn) ||
@@ -5229,27 +5227,25 @@ void ngtcp2_conn_pmtud_on_ack(ngtcp2_conn *conn,
     return;
   }
 
-  ngtcp2_pmtud_blackhole_ack(&conn->pmtud_recovery.blackhole,
-                             ent->hd.pkt_num, ent->pktlen);
+  ngtcp2_pmtud_blackhole_ack(&conn->pmtud_recovery.blackhole, ent->hd.pkt_num,
+                             ent->pktlen);
   if (conn->pmtud_recovery.awaiting_ack &&
       ent->pktlen <= NGTCP2_MAX_UDP_PAYLOAD_SIZE) {
     conn->pmtud_recovery.awaiting_ack = 0;
   }
 }
 
-void ngtcp2_conn_pmtud_on_lost(ngtcp2_conn *conn,
-                               const ngtcp2_rtb_entry *ent) {
+void ngtcp2_conn_pmtud_on_lost(ngtcp2_conn *conn, const ngtcp2_rtb_entry *ent) {
   if (!conn_pmtud_recovery_enabled(conn) ||
       !(ent->flags & NGTCP2_RTB_ENTRY_FLAG_PMTUD_DATA) ||
       (ent->flags & NGTCP2_RTB_ENTRY_FLAG_PMTUD_PROBE)) {
     return;
   }
-  ngtcp2_pmtud_blackhole_lost(&conn->pmtud_recovery.blackhole,
-                              ent->hd.pkt_num, ent->pktlen);
+  ngtcp2_pmtud_blackhole_lost(&conn->pmtud_recovery.blackhole, ent->hd.pkt_num,
+                              ent->pktlen);
 }
 
-void ngtcp2_conn_pmtud_check_blackhole(ngtcp2_conn *conn,
-                                       ngtcp2_tstamp ts) {
+void ngtcp2_conn_pmtud_check_blackhole(ngtcp2_conn *conn, ngtcp2_tstamp ts) {
   if (conn_pmtud_recovery_enabled(conn) &&
       ngtcp2_pmtud_blackhole_detected(&conn->pmtud_recovery.blackhole)) {
     conn_pmtud_fallback(conn, ts);
@@ -13968,7 +13964,8 @@ int ngtcp2_conn_on_loss_detection_timer(ngtcp2_conn *conn, ngtcp2_tstamp ts) {
 
   /* Complete silence supplies no ACK-driven loss rounds. Preserve a
      bounded conservative fallback without declaring old packets lost or
-     resetting congestion/PTO state. Re-search requires new small-packet ACKs. */
+     resetting congestion/PTO state. Re-search requires new small-packet ACKs.
+   */
   if (cstat->pto_count >= 3 && conn_pmtud_recovery_enabled(conn) &&
       conn->dcid.current.max_udp_payload_size > NGTCP2_MAX_UDP_PAYLOAD_SIZE &&
       conn_pmtud_has_unacked_large_pkt(conn)) {

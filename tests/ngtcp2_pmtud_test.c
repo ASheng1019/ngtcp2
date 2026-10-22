@@ -197,8 +197,6 @@ void test_ngtcp2_pmtud_probe(void) {
   ngtcp2_pmtud_del(pmtud);
 }
 
-
-
 /* Loss callbacks are ordered by decreasing packet number, as in ngtcp2 RTB. */
 void test_ngtcp2_pmtud_blackhole_burst_once(void) {
   ngtcp2_pmtud_blackhole bh;
@@ -255,7 +253,8 @@ void test_ngtcp2_pmtud_blackhole_large_ack(void) {
   }
   ngtcp2_pmtud_blackhole_ack(&bh, 9, 1400);
   assert_size(0, ==, bh.num_bursts);
-  /* Equal-sized subsequent delivery must advance the evidence's packet number. */
+  /* Equal-sized subsequent delivery must advance the evidence's packet number.
+   */
   ngtcp2_pmtud_blackhole_ack(&bh, 20, 1400);
   ngtcp2_pmtud_blackhole_lost(&bh, 18, 1400);
   assert_false(ngtcp2_pmtud_blackhole_detected(&bh));
