@@ -115,6 +115,28 @@ static const MunitTest tests[] = {
   munit_void_test(test_ngtcp2_conn_version_negotiation),
   munit_void_test(test_ngtcp2_conn_server_negotiate_version),
   munit_void_test(test_ngtcp2_conn_pmtud_loss),
+  munit_void_test(test_ngtcp2_conn_pmtud_v2_selective),
+  munit_void_test(test_ngtcp2_conn_pmtud_v2_selective_server),
+  munit_void_test(test_ngtcp2_conn_pmtud_v2_selective_ipv6),
+  munit_void_test(test_ngtcp2_conn_pmtud_v2_selective_server_ipv6),
+  munit_void_test(test_ngtcp2_conn_pmtud_v2_reprobe),
+  munit_void_test(test_ngtcp2_conn_pmtud_v2_cooldown),
+  munit_void_test(test_ngtcp2_conn_pmtud_v2_silent_no_reprobe),
+  munit_void_test(test_ngtcp2_conn_pmtud_v2_stale_ack),
+  munit_void_test(test_ngtcp2_conn_pmtud_v2_probe_ack),
+  munit_void_test(test_ngtcp2_conn_pmtud_v2_search_retry),
+  munit_void_test(test_ngtcp2_conn_pmtud_v2_path_epoch),
+  munit_void_test(test_ngtcp2_conn_pmtud_v2_buffer_limit),
+  munit_void_test(test_ngtcp2_conn_pmtud_v2_late_probe),
+  munit_void_test(test_ngtcp2_conn_pmtud_v2_probe_only_pto),
+  munit_void_test(test_ngtcp2_conn_pmtud_v2_probe_then_data_pto),
+  munit_void_test(test_ngtcp2_conn_pmtud_blackhole_client),
+  munit_void_test(test_ngtcp2_conn_pmtud_blackhole_server),
+  munit_void_test(test_ngtcp2_conn_pmtud_blackhole_disabled),
+  munit_void_test(test_ngtcp2_conn_pmtud_blackhole_unshaped),
+  munit_void_test(test_ngtcp2_conn_pmtud_blackhole_unconfirmed),
+  munit_void_test(test_ngtcp2_conn_pmtud_blackhole_base_size),
+  munit_void_test(test_ngtcp2_conn_pmtud_blackhole_ack_reset),
   munit_void_test(test_ngtcp2_conn_amplification),
   munit_void_test(test_ngtcp2_conn_encode_0rtt_transport_params),
   munit_void_test(test_ngtcp2_conn_create_ack_frame),
@@ -16420,6 +16442,646 @@ void test_ngtcp2_conn_pmtud_loss(void) {
   assert_size(0, ==, conn->pktns.rtb.num_lost_ignore_pkts);
   assert_uint64(0, ==, conn->pktns.rtb.cc_bytes_in_flight);
 
+  ngtcp2_conn_del(conn);
+}
+
+enum pmtud_blackhole_case {
+  PMTUD_BLACKHOLE_CLIENT,
+  PMTUD_BLACKHOLE_SERVER,
+  PMTUD_BLACKHOLE_DISABLED,
+  PMTUD_BLACKHOLE_UNSHAPED,
+  PMTUD_BLACKHOLE_UNCONFIRMED,
+  PMTUD_BLACKHOLE_BASE_SIZE,
+  PMTUD_BLACKHOLE_ACK_RESET,
+};
+
+static void check_pmtud_blackhole(enum pmtud_blackhole_case test_case) {
+  ngtcp2_conn *conn;
+  ngtcp2_settings settings;
+  ngtcp2_transport_params remote_params;
+  ngtcp2_tpe tpe;
+  ngtcp2_frame fr;
+  uint8_t buf[2048], data[8192] = {0};
+  ngtcp2_tstamp t = 0;
+  ngtcp2_ssize nwrite, ndatalen;
+  ngtcp2_vec vec = {data, sizeof(data)};
+  int64_t stream_id;
+  size_t len, confirmed, expected;
+  int rv, n;
+
+  if (test_case == PMTUD_BLACKHOLE_SERVER) {
+    server_default_settings(&settings);
+  } else {
+    client_default_settings(&settings);
+  }
+  settings.max_tx_udp_payload_size = 1452;
+  settings.no_tx_udp_payload_size_shaping = 0;
+  settings.pmtud_probes = NULL;
+  settings.pmtud_probeslen = 0;
+  if (test_case == PMTUD_BLACKHOLE_SERVER) {
+    server_default_remote_transport_params(&remote_params);
+    remote_params.initial_max_streams_bidi = 1;
+    setup_default_server_with_options(
+      &conn,
+      (conn_options){.settings = &settings, .remote_params = &remote_params});
+  } else {
+    setup_default_client_with_options(&conn,
+                                      (conn_options){.settings = &settings});
+  }
+  ngtcp2_tpe_init_conn(&tpe, conn);
+  rv = ngtcp2_conn_start_pmtud(conn);
+  assert_int(0, ==, rv);
+
+  /* Confirm the path limit by processing real encoded probe ACKs. */
+  for (n = 0; conn->pmtud && n < 16; ++n) {
+    nwrite = ngtcp2_conn_write_pkt(conn, NULL, NULL, buf, sizeof(buf), ++t);
+    assert_ptrdiff(0, <, nwrite);
+    fr.ack = (ngtcp2_ack){
+      .type = NGTCP2_FRAME_ACK,
+      .largest_ack = conn->pktns.tx.last_pkt_num,
+    };
+    len = ngtcp2_tpe_write_1rtt(&tpe, buf, sizeof(buf), &fr, 1);
+    rv = ngtcp2_conn_read_pkt(conn, &null_path.path, NULL, buf, len, ++t);
+    assert_int(0, ==, rv);
+  }
+  assert_null(conn->pmtud);
+  confirmed = ngtcp2_conn_get_path_max_tx_udp_payload_size2(conn);
+  assert_size(1280, <, confirmed);
+
+  /* These constructed eligibility states exercise each policy guard. */
+  switch (test_case) {
+  case PMTUD_BLACKHOLE_DISABLED:
+    conn->local.settings.no_pmtud = 1;
+    break;
+  case PMTUD_BLACKHOLE_UNSHAPED:
+    conn->local.settings.no_tx_udp_payload_size_shaping = 1;
+    conn->cstat.max_tx_udp_payload_size = settings.max_tx_udp_payload_size;
+    break;
+  case PMTUD_BLACKHOLE_UNCONFIRMED:
+    break;
+  case PMTUD_BLACKHOLE_BASE_SIZE:
+    conn->dcid.current.max_udp_payload_size = NGTCP2_MAX_UDP_PAYLOAD_SIZE;
+    conn->cstat.max_tx_udp_payload_size = NGTCP2_MAX_UDP_PAYLOAD_SIZE;
+    break;
+  default:
+    break;
+  }
+  confirmed = ngtcp2_conn_get_path_max_tx_udp_payload_size2(conn);
+  expected =
+    test_case == PMTUD_BLACKHOLE_CLIENT || test_case == PMTUD_BLACKHOLE_SERVER
+      ? NGTCP2_MAX_UDP_PAYLOAD_SIZE
+      : confirmed;
+  rv = ngtcp2_conn_open_bidi_stream(conn, &stream_id, NULL);
+  assert_int(0, ==, rv);
+  nwrite = ngtcp2_conn_writev_stream(conn, NULL, NULL, buf, sizeof(buf),
+                                     &ndatalen, NGTCP2_WRITE_STREAM_FLAG_NONE,
+                                     stream_id, &vec, 1, ++t);
+  assert_ptrdiff(0, <, nwrite);
+  if (test_case != PMTUD_BLACKHOLE_BASE_SIZE) {
+    assert_ptrdiff(1280, <, nwrite);
+  }
+
+  if (test_case == PMTUD_BLACKHOLE_UNCONFIRMED) {
+    /* Exercise the threshold guard with an armed timer. Application-only
+       PTO can then be cancelled before handshake confirmation. */
+    conn->flags &= ~NGTCP2_CONN_FLAG_HANDSHAKE_CONFIRMED;
+    conn->cstat.pto_count = 2;
+    rv = ngtcp2_conn_on_loss_detection_timer(conn,
+                                             conn->cstat.loss_detection_timer);
+    assert_int(0, ==, rv);
+    assert_size(confirmed, ==,
+                ngtcp2_conn_get_path_max_tx_udp_payload_size2(conn));
+    assert_size(confirmed, ==, conn->cstat.max_tx_udp_payload_size);
+    ngtcp2_conn_del(conn);
+    return;
+  }
+
+  /* Drop all outgoing packets; expiry must schedule usable retransmissions. */
+  for (n = 0; conn->cstat.pto_count < 3 && n < 16; ++n) {
+    t = conn->cstat.loss_detection_timer;
+    assert_uint64(UINT64_MAX, !=, t);
+    rv = ngtcp2_conn_handle_expiry(conn, t);
+    assert_int(0, ==, rv);
+    if (conn->cstat.pto_count < 3) {
+      assert_size(confirmed, ==,
+                  ngtcp2_conn_get_path_max_tx_udp_payload_size2(conn));
+    }
+    nwrite = ngtcp2_conn_write_pkt(conn, NULL, NULL, buf, sizeof(buf), ++t);
+    assert_ptrdiff(0, <, nwrite);
+    if (test_case == PMTUD_BLACKHOLE_ACK_RESET && conn->cstat.pto_count == 2) {
+      break;
+    }
+  }
+  assert_uint64(test_case == PMTUD_BLACKHOLE_ACK_RESET ? 2 : 3, ==,
+                conn->cstat.pto_count);
+  assert_size(expected, ==,
+              ngtcp2_conn_get_path_max_tx_udp_payload_size2(conn));
+  assert_size(expected, ==, conn->cstat.max_tx_udp_payload_size);
+  if (expected == NGTCP2_MAX_UDP_PAYLOAD_SIZE) {
+    assert_ptrdiff(NGTCP2_MAX_UDP_PAYLOAD_SIZE, >=, nwrite);
+  }
+
+  /* An ACK resets PTO; it must not immediately re-probe the failed limit. */
+  fr.ack = (ngtcp2_ack){
+    .type = NGTCP2_FRAME_ACK,
+    .largest_ack = conn->pktns.tx.last_pkt_num,
+  };
+  len = ngtcp2_tpe_write_1rtt(&tpe, buf, sizeof(buf), &fr, 1);
+  rv = ngtcp2_conn_read_pkt(conn, &null_path.path, NULL, buf, len, ++t);
+  assert_int(0, ==, rv);
+  assert_uint64(0, ==, conn->cstat.pto_count);
+  assert_int(NGTCP2_CS_POST_HANDSHAKE, ==, conn->state);
+  assert_size(expected, ==,
+              ngtcp2_conn_get_path_max_tx_udp_payload_size2(conn));
+  assert_null(conn->pmtud);
+  ngtcp2_conn_del(conn);
+}
+
+void test_ngtcp2_conn_pmtud_blackhole_client(void) {
+  check_pmtud_blackhole(PMTUD_BLACKHOLE_CLIENT);
+}
+
+void test_ngtcp2_conn_pmtud_blackhole_server(void) {
+  check_pmtud_blackhole(PMTUD_BLACKHOLE_SERVER);
+}
+
+void test_ngtcp2_conn_pmtud_blackhole_disabled(void) {
+  check_pmtud_blackhole(PMTUD_BLACKHOLE_DISABLED);
+}
+
+void test_ngtcp2_conn_pmtud_blackhole_unshaped(void) {
+  check_pmtud_blackhole(PMTUD_BLACKHOLE_UNSHAPED);
+}
+
+void test_ngtcp2_conn_pmtud_blackhole_unconfirmed(void) {
+  check_pmtud_blackhole(PMTUD_BLACKHOLE_UNCONFIRMED);
+}
+
+void test_ngtcp2_conn_pmtud_blackhole_base_size(void) {
+  check_pmtud_blackhole(PMTUD_BLACKHOLE_BASE_SIZE);
+}
+
+void test_ngtcp2_conn_pmtud_blackhole_ack_reset(void) {
+  check_pmtud_blackhole(PMTUD_BLACKHOLE_ACK_RESET);
+}
+
+/* Connection-level regressions: all ACKs go through encoded 1-RTT packets. */
+static void pmtud_v2_ack(ngtcp2_conn *conn, ngtcp2_tpe *tpe, int64_t pkt_num,
+                         ngtcp2_tstamp *ts) {
+  uint8_t buf[2048];
+  ngtcp2_frame fr = {.ack = {.type = NGTCP2_FRAME_ACK, .largest_ack = pkt_num}};
+  size_t len = ngtcp2_tpe_write_1rtt(tpe, buf, sizeof(buf), &fr, 1);
+  int rv = ngtcp2_conn_read_pkt(conn, &conn->dcid.current.ps.path, NULL, buf,
+                                len, ++*ts);
+  assert_int(0, ==, rv);
+}
+
+static void pmtud_v2_setup_options(ngtcp2_conn **pconn, ngtcp2_tpe *tpe,
+                                   ngtcp2_tstamp *ts, int server, int ipv6) {
+  ngtcp2_settings settings;
+  ngtcp2_transport_params remote_params;
+  ngtcp2_path_storage ps;
+  ngtcp2_sockaddr_in6 local = {.sin6_family = NGTCP2_AF_INET6},
+                      remote = {.sin6_family = NGTCP2_AF_INET6};
+  const ngtcp2_path *path = &null_path.path;
+  uint8_t buf[2048];
+  int n, rv;
+  ngtcp2_ssize nwrite;
+
+  if (server) {
+    server_default_settings(&settings);
+    server_default_remote_transport_params(&remote_params);
+    remote_params.initial_max_streams_bidi = 1;
+  } else {
+    client_default_settings(&settings);
+    client_default_remote_transport_params(&remote_params);
+    remote_params.initial_max_streams_bidi = 8;
+  }
+  settings.max_tx_udp_payload_size = 1452;
+  settings.no_tx_udp_payload_size_shaping = 0;
+  settings.pmtud_probes = NULL;
+  settings.pmtud_probeslen = 0;
+  if (ipv6) {
+    local.sin6_addr.s6_addr[15] = 1;
+    remote.sin6_addr.s6_addr[15] = 2;
+    ngtcp2_path_storage_init(&ps, (ngtcp2_sockaddr *)&local, sizeof(local),
+                             (ngtcp2_sockaddr *)&remote, sizeof(remote), NULL);
+    path = &ps.path;
+  }
+  if (server) {
+    setup_default_server_with_options(
+      pconn, (conn_options){.settings = &settings,
+                            .remote_params = &remote_params,
+                            .path = path});
+  } else {
+    setup_default_client_with_options(
+      pconn, (conn_options){.settings = &settings,
+                            .remote_params = &remote_params,
+                            .path = path});
+  }
+  (*pconn)->local.transport_params.max_idle_timeout = 0;
+  (*pconn)->remote.transport_params->max_idle_timeout = 0;
+  ngtcp2_tpe_init_conn(tpe, *pconn);
+  rv = ngtcp2_conn_start_pmtud(*pconn);
+  assert_int(0, ==, rv);
+  for (n = 0; (*pconn)->pmtud && n < 16; ++n) {
+    nwrite = ngtcp2_conn_write_pkt(*pconn, NULL, NULL, buf, sizeof(buf), ++*ts);
+    assert_ptrdiff(0, <, nwrite);
+    pmtud_v2_ack(*pconn, tpe, (*pconn)->pktns.tx.last_pkt_num, ts);
+  }
+  assert_null((*pconn)->pmtud);
+  assert_size(1444, ==, (*pconn)->dcid.current.max_udp_payload_size);
+}
+
+static void pmtud_v2_setup(ngtcp2_conn **pconn, ngtcp2_tpe *tpe,
+                           ngtcp2_tstamp *ts) {
+  pmtud_v2_setup_options(pconn, tpe, ts, 0, 0);
+}
+
+static void pmtud_v2_selective(int server, int ipv6) {
+  ngtcp2_conn *conn;
+  ngtcp2_tpe tpe;
+  ngtcp2_tstamp ts = 0;
+  uint8_t buf[2048], data[4096] = {0};
+  ngtcp2_vec vec = {data, sizeof(data)}, small = {data, 1};
+  ngtcp2_ssize nwrite, ndatalen;
+  int64_t stream_id;
+  int i, rv;
+
+  pmtud_v2_setup_options(&conn, &tpe, &ts, server, ipv6);
+  rv = ngtcp2_conn_open_bidi_stream(conn, &stream_id, NULL);
+  assert_int(0, ==, rv);
+  for (i = 0; i < 4; ++i) {
+    ts += NGTCP2_SECONDS;
+    nwrite = ngtcp2_conn_writev_stream(conn, NULL, NULL, buf, sizeof(buf),
+                                       &ndatalen, 0, stream_id, &vec, 1, ts);
+    assert_ptrdiff(1280, <, nwrite);
+    ts += NGTCP2_SECONDS;
+    nwrite = ngtcp2_conn_writev_stream(conn, NULL, NULL, buf, 1200, &ndatalen,
+                                       0, stream_id, &small, 1, ts);
+    assert_ptrdiff(0, <, nwrite);
+    assert_ptrdiff(1200, >=, nwrite);
+    /* The oversized packet is dropped; only this smaller packet is ACKed. */
+    pmtud_v2_ack(conn, &tpe, conn->pktns.tx.last_pkt_num, &ts);
+    assert_uint64(0, ==, conn->cstat.pto_count);
+    if (i < 3) {
+      assert_size(1444, ==, conn->dcid.current.max_udp_payload_size);
+    }
+  }
+  assert_size(1200, ==, conn->dcid.current.max_udp_payload_size);
+  assert_size(1200, ==, conn->cstat.max_tx_udp_payload_size);
+  ngtcp2_conn_del(conn);
+}
+
+void test_ngtcp2_conn_pmtud_v2_selective(void) { pmtud_v2_selective(0, 0); }
+
+void test_ngtcp2_conn_pmtud_v2_selective_server(void) {
+  pmtud_v2_selective(1, 0);
+}
+
+void test_ngtcp2_conn_pmtud_v2_selective_ipv6(void) {
+  pmtud_v2_selective(0, 1);
+}
+
+void test_ngtcp2_conn_pmtud_v2_selective_server_ipv6(void) {
+  pmtud_v2_selective(1, 1);
+}
+
+static void pmtud_v2_silence(ngtcp2_conn *conn, ngtcp2_tstamp *ts) {
+  uint8_t buf[2048];
+  /* ngtcp2 borrows stream data until it is acknowledged or conn is deleted. */
+  static uint8_t data[4096];
+  ngtcp2_vec vec = {data, sizeof(data)};
+  ngtcp2_ssize nwrite, ndatalen;
+  int64_t stream_id;
+  int i, rv;
+
+  rv = ngtcp2_conn_open_bidi_stream(conn, &stream_id, NULL);
+  assert_int(0, ==, rv);
+  nwrite = ngtcp2_conn_writev_stream(conn, NULL, NULL, buf, sizeof(buf),
+                                     &ndatalen, 0, stream_id, &vec, 1, ++*ts);
+  assert_ptrdiff(1280, <, nwrite);
+  for (i = 0; conn->cstat.pto_count < 3 && i < 16; ++i) {
+    *ts = conn->cstat.loss_detection_timer;
+    assert_uint64(UINT64_MAX, !=, *ts);
+    rv = ngtcp2_conn_handle_expiry(conn, *ts);
+    assert_int(0, ==, rv);
+    nwrite = ngtcp2_conn_write_pkt(conn, NULL, NULL, buf, sizeof(buf), ++*ts);
+    assert_ptrdiff(0, <, nwrite);
+  }
+  assert_uint64(3, ==, conn->cstat.pto_count);
+  assert_size(1200, ==, conn->dcid.current.max_udp_payload_size);
+  assert_ptrdiff(1200, >=, nwrite);
+}
+
+void test_ngtcp2_conn_pmtud_v2_reprobe(void) {
+  ngtcp2_conn *conn;
+  ngtcp2_tpe tpe;
+  ngtcp2_tstamp ts = 0;
+  uint8_t buf[2048];
+  ngtcp2_ssize nwrite;
+  int i, rv;
+
+  pmtud_v2_setup(&conn, &tpe, &ts);
+  pmtud_v2_silence(conn, &ts);
+  pmtud_v2_ack(conn, &tpe, conn->pktns.tx.last_pkt_num, &ts);
+  assert_null(conn->pmtud);
+  ts += 61 * NGTCP2_SECONDS;
+  rv = ngtcp2_conn_handle_expiry(conn, ts);
+  assert_int(0, ==, rv);
+  nwrite = ngtcp2_conn_write_pkt(conn, NULL, NULL, buf, sizeof(buf), ++ts);
+  assert_ptrdiff(1200, <, nwrite);
+  /* The path has grown back; ACK real probes and recover the prior limit. */
+  pmtud_v2_ack(conn, &tpe, conn->pktns.tx.last_pkt_num, &ts);
+  for (i = 0; conn->pmtud && i < 16; ++i) {
+    ts += NGTCP2_SECONDS;
+    nwrite = ngtcp2_conn_write_pkt(conn, NULL, NULL, buf, sizeof(buf), ts);
+    assert_ptrdiff(0, <, nwrite);
+    pmtud_v2_ack(conn, &tpe, conn->pktns.tx.last_pkt_num, &ts);
+  }
+  assert_size(1444, ==, conn->dcid.current.max_udp_payload_size);
+  ngtcp2_conn_del(conn);
+}
+
+void test_ngtcp2_conn_pmtud_v2_cooldown(void) {
+  ngtcp2_conn *conn;
+  ngtcp2_tpe tpe;
+  ngtcp2_tstamp ts = 0, deadline;
+  uint8_t buf[2048];
+  ngtcp2_ssize nwrite;
+
+  pmtud_v2_setup(&conn, &tpe, &ts);
+  pmtud_v2_silence(conn, &ts);
+  deadline = conn->pmtud_recovery.next_probe_ts;
+  pmtud_v2_ack(conn, &tpe, conn->pktns.tx.last_pkt_num, &ts);
+  assert_false(conn->pmtud_recovery.awaiting_ack);
+  ts = deadline - 1;
+  nwrite = ngtcp2_conn_write_pkt(conn, NULL, NULL, buf, sizeof(buf), ts);
+  assert_ptrdiff(0, <=, nwrite);
+  assert_ptrdiff(1200, >=, nwrite);
+  assert_null(conn->pmtud);
+  ts = deadline + 1;
+  nwrite = ngtcp2_conn_write_pkt(conn, NULL, NULL, buf, sizeof(buf), ts);
+  assert_ptrdiff(1200, <, nwrite);
+  assert_not_null(conn->pmtud);
+  ngtcp2_conn_del(conn);
+}
+
+void test_ngtcp2_conn_pmtud_v2_silent_no_reprobe(void) {
+  ngtcp2_conn *conn;
+  ngtcp2_tpe tpe;
+  ngtcp2_tstamp ts = 0;
+  uint8_t buf[2048];
+  ngtcp2_ssize nwrite;
+  int rv, i;
+
+  pmtud_v2_setup(&conn, &tpe, &ts);
+  pmtud_v2_silence(conn, &ts);
+  assert_true(conn->pmtud_recovery.awaiting_ack);
+  for (i = 0; i < 2; ++i) {
+    ts += 601 * NGTCP2_SECONDS;
+    rv = ngtcp2_conn_handle_expiry(conn, ts);
+    assert_int(0, ==, rv);
+    nwrite = ngtcp2_conn_write_pkt(conn, NULL, NULL, buf, sizeof(buf), ++ts);
+    assert_ptrdiff(0, <=, nwrite);
+    assert_ptrdiff(1200, >=, nwrite);
+    assert_null(conn->pmtud);
+    assert_true(conn->pmtud_recovery.awaiting_ack);
+  }
+  assert_size(1200, ==, conn->dcid.current.max_udp_payload_size);
+  ngtcp2_conn_del(conn);
+}
+
+void test_ngtcp2_conn_pmtud_v2_stale_ack(void) {
+  ngtcp2_conn *conn;
+  ngtcp2_tpe tpe;
+  ngtcp2_tstamp ts = 0;
+  uint8_t buf[2048], data = 0;
+  ngtcp2_vec vec = {&data, 1};
+  ngtcp2_ssize nwrite, ndatalen;
+  int64_t stream_id, old_pkt_num;
+  int rv;
+
+  pmtud_v2_setup(&conn, &tpe, &ts);
+  rv = ngtcp2_conn_open_uni_stream(conn, &stream_id, NULL);
+  assert_int(0, ==, rv);
+  nwrite = ngtcp2_conn_writev_stream(conn, NULL, NULL, buf, 1200, &ndatalen, 0,
+                                     stream_id, &vec, 1, ++ts);
+  assert_ptrdiff(0, <, nwrite);
+  old_pkt_num = conn->pktns.tx.last_pkt_num;
+  pmtud_v2_silence(conn, &ts);
+  pmtud_v2_ack(conn, &tpe, old_pkt_num, &ts);
+  assert_true(conn->pmtud_recovery.awaiting_ack);
+  assert_size(1200, ==, conn->dcid.current.max_udp_payload_size);
+  ngtcp2_conn_del(conn);
+}
+
+void test_ngtcp2_conn_pmtud_v2_probe_ack(void) {
+  ngtcp2_conn *conn;
+  ngtcp2_tpe tpe;
+  ngtcp2_tstamp ts = 0;
+  uint8_t buf[2048];
+  ngtcp2_ssize nwrite;
+  int rv;
+
+  pmtud_v2_setup(&conn, &tpe, &ts);
+  /* A constructed history isolates feedback from a real encoded probe ACK. */
+  ngtcp2_pmtud_blackhole_lost(&conn->pmtud_recovery.blackhole, 0, 1400);
+  assert_false(
+    ngtcp2_pmtud_blackhole_detected(&conn->pmtud_recovery.blackhole));
+  conn->dcid.current.max_udp_payload_size = 1406;
+  conn->cstat.max_tx_udp_payload_size = 1406;
+  rv = ngtcp2_conn_start_pmtud(conn);
+  assert_int(0, ==, rv);
+  nwrite = ngtcp2_conn_write_pkt(conn, NULL, NULL, buf, sizeof(buf), ++ts);
+  assert_ptrdiff(1444, ==, nwrite);
+  pmtud_v2_ack(conn, &tpe, conn->pktns.tx.last_pkt_num, &ts);
+  assert_size(0, ==, conn->pmtud_recovery.blackhole.num_bursts);
+  ngtcp2_conn_del(conn);
+}
+
+void test_ngtcp2_conn_pmtud_v2_search_retry(void) {
+  ngtcp2_conn *conn;
+  ngtcp2_tpe tpe;
+  ngtcp2_tstamp ts = 0;
+  uint8_t buf[2048];
+  ngtcp2_ssize nwrite;
+  int i, rv;
+
+  pmtud_v2_setup(&conn, &tpe, &ts);
+  /* Search from a lower confirmed size. Drop the only larger candidate. */
+  conn->dcid.current.max_udp_payload_size = 1406;
+  conn->cstat.max_tx_udp_payload_size = 1406;
+  rv = ngtcp2_conn_start_pmtud(conn);
+  assert_int(0, ==, rv);
+  for (i = 0; conn->pmtud && i < 8; ++i) {
+    nwrite = ngtcp2_conn_write_pkt(conn, NULL, NULL, buf, sizeof(buf), ++ts);
+    assert_ptrdiff(1444, ==, nwrite);
+    ts = conn->pmtud->expiry;
+    rv = ngtcp2_conn_handle_expiry(conn, ts);
+    assert_int(0, ==, rv);
+  }
+  assert_null(conn->pmtud);
+  assert_size(1406, ==, conn->dcid.current.max_udp_payload_size);
+  ts = conn->pmtud_recovery.next_probe_ts + 1;
+  nwrite = ngtcp2_conn_write_pkt(conn, NULL, NULL, buf, sizeof(buf), ts);
+  assert_ptrdiff(1444, ==, nwrite);
+  pmtud_v2_ack(conn, &tpe, conn->pktns.tx.last_pkt_num, &ts);
+  assert_size(1444, ==, conn->dcid.current.max_udp_payload_size);
+  ngtcp2_conn_del(conn);
+}
+
+void test_ngtcp2_conn_pmtud_v2_path_epoch(void) {
+  ngtcp2_conn *conn;
+  ngtcp2_tpe tpe;
+  ngtcp2_tstamp ts = 0;
+  ngtcp2_frame fr;
+  uint8_t buf[2048];
+  ngtcp2_path_storage to_path;
+  static const ngtcp2_cid cid = {.datalen = 4, .data = {15}};
+  size_t len;
+  int rv;
+
+  pmtud_v2_setup(&conn, &tpe, &ts);
+  ngtcp2_pmtud_blackhole_lost(&conn->pmtud_recovery.blackhole, 0, 1400);
+  assert_false(
+    ngtcp2_pmtud_blackhole_detected(&conn->pmtud_recovery.blackhole));
+  fr.new_connection_id = (ngtcp2_new_connection_id){
+    .type = NGTCP2_FRAME_NEW_CONNECTION_ID,
+    .seq = 1,
+    .cid = cid,
+  };
+  len = ngtcp2_tpe_write_1rtt(&tpe, buf, sizeof(buf), &fr, 1);
+  rv = ngtcp2_conn_read_pkt(conn, &null_path.path, NULL, buf, len, ++ts);
+  assert_int(0, ==, rv);
+  ngtcp2_path_storage_init2(&to_path, &new_path.path);
+  rv = ngtcp2_conn_initiate_immediate_migration(conn, &to_path.path, ++ts);
+  assert_int(0, ==, rv);
+  assert_size(0, ==, conn->pmtud_recovery.blackhole.num_bursts);
+  assert_int64(conn->pktns.tx.last_pkt_num + 1, ==,
+               conn->pmtud_recovery.blackhole.min_pkt_num);
+  assert_uint64(UINT64_MAX, ==, conn->pmtud_recovery.next_probe_ts);
+  assert_false(conn->pmtud_recovery.awaiting_ack);
+  ngtcp2_conn_del(conn);
+}
+
+void test_ngtcp2_conn_pmtud_v2_buffer_limit(void) {
+  ngtcp2_conn *conn;
+  ngtcp2_tpe tpe;
+  ngtcp2_tstamp ts = 0;
+  uint8_t buf[2048];
+  ngtcp2_ssize nwrite;
+
+  pmtud_v2_setup(&conn, &tpe, &ts);
+  pmtud_v2_silence(conn, &ts);
+  pmtud_v2_ack(conn, &tpe, conn->pktns.tx.last_pkt_num, &ts);
+  ts = conn->pmtud_recovery.next_probe_ts + 1;
+  nwrite = ngtcp2_conn_write_pkt(conn, NULL, NULL, buf, 1200, ts);
+  assert_ptrdiff(0, <=, nwrite);
+  assert_ptrdiff(1200, >=, nwrite);
+  assert_size(1200, ==, conn->dcid.current.max_udp_payload_size);
+  assert_not_null(conn->pmtud);
+  assert_size(0, ==, conn->pmtud->num_pkts_sent);
+  ts += NGTCP2_SECONDS;
+  nwrite = ngtcp2_conn_write_pkt(conn, NULL, NULL, buf, sizeof(buf), ts);
+  assert_ptrdiff(1200, <, nwrite);
+  ngtcp2_conn_del(conn);
+}
+
+void test_ngtcp2_conn_pmtud_v2_late_probe(void) {
+  ngtcp2_conn *conn;
+  ngtcp2_tpe tpe;
+  ngtcp2_tstamp ts = 0;
+  uint8_t buf[2048];
+  ngtcp2_ssize nwrite;
+  int64_t old_probe;
+  int rv;
+
+  pmtud_v2_setup(&conn, &tpe, &ts);
+  conn->dcid.current.max_udp_payload_size = 1406;
+  conn->cstat.max_tx_udp_payload_size = 1406;
+  rv = ngtcp2_conn_start_pmtud(conn);
+  assert_int(0, ==, rv);
+  nwrite = ngtcp2_conn_write_pkt(conn, NULL, NULL, buf, sizeof(buf), ++ts);
+  assert_ptrdiff(1444, ==, nwrite);
+  old_probe = conn->pktns.tx.last_pkt_num;
+  pmtud_v2_silence(conn, &ts);
+  pmtud_v2_ack(conn, &tpe, conn->pktns.tx.last_pkt_num, &ts);
+  ts = conn->pmtud_recovery.next_probe_ts + 1;
+  nwrite = ngtcp2_conn_write_pkt(conn, NULL, NULL, buf, sizeof(buf), ts);
+  assert_ptrdiff(1406, ==, nwrite);
+  /* Old larger probe ACK cannot confirm this recovery generation. */
+  pmtud_v2_ack(conn, &tpe, old_probe, &ts);
+  assert_size(1200, ==, conn->dcid.current.max_udp_payload_size);
+  pmtud_v2_ack(conn, &tpe, conn->pktns.tx.last_pkt_num, &ts);
+  assert_size(1406, ==, conn->dcid.current.max_udp_payload_size);
+  ngtcp2_conn_del(conn);
+}
+
+void test_ngtcp2_conn_pmtud_v2_probe_only_pto(void) {
+  ngtcp2_conn *conn;
+  ngtcp2_tpe tpe;
+  ngtcp2_tstamp ts = 0;
+  uint8_t buf[2048];
+  ngtcp2_ssize nwrite;
+  int rv, i;
+
+  pmtud_v2_setup(&conn, &tpe, &ts);
+  /* Losing an upward probe says nothing about this confirmed size. */
+  conn->dcid.current.max_udp_payload_size = 1406;
+  conn->cstat.max_tx_udp_payload_size = 1406;
+  rv = ngtcp2_conn_start_pmtud(conn);
+  assert_int(0, ==, rv);
+  nwrite = ngtcp2_conn_write_pkt(conn, NULL, NULL, buf, sizeof(buf), ++ts);
+  assert_ptrdiff(1444, ==, nwrite);
+  for (i = 0; conn->cstat.pto_count < 3 && i < 16; ++i) {
+    ts = conn->cstat.loss_detection_timer;
+    assert_uint64(UINT64_MAX, !=, ts);
+    rv = ngtcp2_conn_handle_expiry(conn, ts);
+    assert_int(0, ==, rv);
+    nwrite = ngtcp2_conn_write_pkt(conn, NULL, NULL, buf, sizeof(buf), ++ts);
+    assert_ptrdiff(0, <, nwrite);
+  }
+  assert_uint64(3, ==, conn->cstat.pto_count);
+  assert_size(1406, ==, conn->dcid.current.max_udp_payload_size);
+  ngtcp2_conn_del(conn);
+}
+
+void test_ngtcp2_conn_pmtud_v2_probe_then_data_pto(void) {
+  ngtcp2_conn *conn;
+  ngtcp2_tpe tpe;
+  ngtcp2_tstamp ts = 0;
+  uint8_t buf[2048], data[4096] = {0};
+  ngtcp2_vec vec = {data, sizeof(data)};
+  ngtcp2_ssize nwrite, ndatalen;
+  int64_t stream_id;
+  int rv, i;
+
+  pmtud_v2_setup(&conn, &tpe, &ts);
+  conn->dcid.current.max_udp_payload_size = 1406;
+  conn->cstat.max_tx_udp_payload_size = 1406;
+  rv = ngtcp2_conn_start_pmtud(conn);
+  assert_int(0, ==, rv);
+  nwrite = ngtcp2_conn_write_pkt(conn, NULL, NULL, buf, sizeof(buf), ++ts);
+  assert_ptrdiff(1444, ==, nwrite);
+  for (i = 0; conn->cstat.pto_count < 3 && i < 16; ++i) {
+    ts = conn->cstat.loss_detection_timer;
+    rv = ngtcp2_conn_handle_expiry(conn, ts);
+    assert_int(0, ==, rv);
+    nwrite = ngtcp2_conn_write_pkt(conn, NULL, NULL, buf, sizeof(buf), ++ts);
+    assert_ptrdiff(0, <, nwrite);
+  }
+  assert_size(1406, ==, conn->dcid.current.max_udp_payload_size);
+  rv = ngtcp2_conn_open_bidi_stream(conn, &stream_id, NULL);
+  assert_int(0, ==, rv);
+  nwrite = ngtcp2_conn_writev_stream(conn, NULL, NULL, buf, sizeof(buf),
+                                     &ndatalen, 0, stream_id, &vec, 1, ++ts);
+  assert_ptrdiff(1200, <, nwrite);
+  ts = conn->cstat.loss_detection_timer;
+  rv = ngtcp2_conn_handle_expiry(conn, ts);
+  assert_int(0, ==, rv);
+  assert_uint64(3, <, conn->cstat.pto_count);
+  assert_size(1200, ==, conn->dcid.current.max_udp_payload_size);
   ngtcp2_conn_del(conn);
 }
 

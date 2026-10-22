@@ -625,6 +625,7 @@ struct ngtcp2_conn {
   ngtcp2_conn_stat cstat;
   ngtcp2_pv *pv;
   ngtcp2_pmtud *pmtud;
+  ngtcp2_pmtud_recovery pmtud_recovery;
   ngtcp2_log log;
   ngtcp2_qlog qlog;
   ngtcp2_rst rst;
@@ -1016,6 +1017,11 @@ ngtcp2_ssize ngtcp2_conn_write_application_close_pkt(
 int ngtcp2_conn_start_pmtud(ngtcp2_conn *conn);
 
 void ngtcp2_conn_stop_pmtud(ngtcp2_conn *conn);
+void ngtcp2_conn_pmtud_on_ack(ngtcp2_conn *conn, const ngtcp2_rtb_entry *ent,
+                              ngtcp2_tstamp ts);
+void ngtcp2_conn_pmtud_on_lost(ngtcp2_conn *conn, const ngtcp2_rtb_entry *ent);
+void ngtcp2_conn_pmtud_check_blackhole(ngtcp2_conn *conn, ngtcp2_tstamp ts);
+void ngtcp2_conn_pmtud_completed(ngtcp2_conn *conn, ngtcp2_tstamp ts);
 
 /**
  * @function

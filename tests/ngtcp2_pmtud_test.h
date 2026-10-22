@@ -36,5 +36,14 @@
 extern const MunitSuite pmtud_suite;
 
 munit_void_test_decl(test_ngtcp2_pmtud_probe)
+munit_void_test_decl(test_ngtcp2_pmtud_blackhole_burst_once)
+munit_void_test_decl(test_ngtcp2_pmtud_blackhole_separate_bursts)
+munit_void_test_decl(test_ngtcp2_pmtud_blackhole_mixed_loss)
+munit_void_test_decl(test_ngtcp2_pmtud_blackhole_small_ack)
+munit_void_test_decl(test_ngtcp2_pmtud_blackhole_large_ack)
+munit_void_test_decl(test_ngtcp2_pmtud_blackhole_old_ack)
+munit_void_test_decl(test_ngtcp2_pmtud_blackhole_epoch)
+munit_void_test_decl(test_ngtcp2_pmtud_blackhole_bounded)
+munit_void_test_decl(test_ngtcp2_pmtud_blackhole_ordinary_loss)
 
 #endif /* !defined(NGTCP2_PMTUD_TEST_H) */
