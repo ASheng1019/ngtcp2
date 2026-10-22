@@ -83,6 +83,9 @@ typedef struct ngtcp2_frame_chain ngtcp2_frame_chain;
 /* NGTCP2_RTB_ENTRY_FLAG_SKIP indicates that the entry has the skipped
    packet number. */
 #define NGTCP2_RTB_ENTRY_FLAG_SKIP 0x200U
+/* A standalone 1-RTT packet sent on the active path, excluding explicit
+   PMTUD probes. Its QUIC packet length equals the UDP payload length. */
+#define NGTCP2_RTB_ENTRY_FLAG_PMTUD_DATA 0x400U
 
 typedef struct ngtcp2_rtb_entry ngtcp2_rtb_entry;
 

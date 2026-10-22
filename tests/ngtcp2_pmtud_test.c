@@ -31,6 +31,15 @@
 
 static const MunitTest tests[] = {
   munit_void_test(test_ngtcp2_pmtud_probe),
+  munit_void_test(test_ngtcp2_pmtud_blackhole_burst_once),
+  munit_void_test(test_ngtcp2_pmtud_blackhole_separate_bursts),
+  munit_void_test(test_ngtcp2_pmtud_blackhole_mixed_loss),
+  munit_void_test(test_ngtcp2_pmtud_blackhole_small_ack),
+  munit_void_test(test_ngtcp2_pmtud_blackhole_large_ack),
+  munit_void_test(test_ngtcp2_pmtud_blackhole_old_ack),
+  munit_void_test(test_ngtcp2_pmtud_blackhole_epoch),
+  munit_void_test(test_ngtcp2_pmtud_blackhole_bounded),
+  munit_void_test(test_ngtcp2_pmtud_blackhole_ordinary_loss),
   munit_test_end(),
 };
 
@@ -186,4 +195,119 @@ void test_ngtcp2_pmtud_probe(void) {
   assert_true(ngtcp2_pmtud_finished(pmtud));
 
   ngtcp2_pmtud_del(pmtud);
+}
+
+
+
+/* Loss callbacks are ordered by decreasing packet number, as in ngtcp2 RTB. */
+void test_ngtcp2_pmtud_blackhole_burst_once(void) {
+  ngtcp2_pmtud_blackhole bh;
+  int64_t pn;
+  ngtcp2_pmtud_blackhole_init(&bh, 0);
+  for (pn = 40; pn > 0; --pn) {
+    ngtcp2_pmtud_blackhole_lost(&bh, pn, 1400);
+  }
+  assert_false(ngtcp2_pmtud_blackhole_detected(&bh));
+  assert_size(1, ==, bh.num_bursts);
+}
+
+void test_ngtcp2_pmtud_blackhole_separate_bursts(void) {
+  ngtcp2_pmtud_blackhole bh;
+  int64_t pn;
+  ngtcp2_pmtud_blackhole_init(&bh, 0);
+  for (pn = 20; pn >= 2; pn -= 2) {
+    ngtcp2_pmtud_blackhole_lost(&bh, pn, 1400);
+  }
+  assert_true(ngtcp2_pmtud_blackhole_detected(&bh));
+  assert_size(4, ==, bh.num_bursts);
+}
+
+void test_ngtcp2_pmtud_blackhole_mixed_loss(void) {
+  ngtcp2_pmtud_blackhole bh;
+  int i;
+  ngtcp2_pmtud_blackhole_init(&bh, 0);
+  for (i = 0; i < 20; ++i) {
+    ngtcp2_pmtud_blackhole_lost(&bh, 3 * i + 2, 1400);
+    ngtcp2_pmtud_blackhole_lost(&bh, 3 * i + 1, 1200);
+    assert_false(ngtcp2_pmtud_blackhole_detected(&bh));
+  }
+  assert_size(0, ==, bh.num_bursts);
+}
+
+void test_ngtcp2_pmtud_blackhole_small_ack(void) {
+  ngtcp2_pmtud_blackhole bh;
+  int i;
+  ngtcp2_pmtud_blackhole_init(&bh, 0);
+  for (i = 0; i < 4; ++i) {
+    ngtcp2_pmtud_blackhole_lost(&bh, 2 * i, 1400);
+    ngtcp2_pmtud_blackhole_ack(&bh, 2 * i + 1, 1100);
+    assert_int(i == 3, ==, ngtcp2_pmtud_blackhole_detected(&bh));
+  }
+}
+
+void test_ngtcp2_pmtud_blackhole_large_ack(void) {
+  ngtcp2_pmtud_blackhole bh;
+  int i;
+  ngtcp2_pmtud_blackhole_init(&bh, 0);
+  for (i = 0; i < 3; ++i) {
+    ngtcp2_pmtud_blackhole_lost(&bh, 2 * i, 1400);
+    assert_false(ngtcp2_pmtud_blackhole_detected(&bh));
+  }
+  ngtcp2_pmtud_blackhole_ack(&bh, 9, 1400);
+  assert_size(0, ==, bh.num_bursts);
+  /* Equal-sized subsequent delivery must advance the evidence's packet number. */
+  ngtcp2_pmtud_blackhole_ack(&bh, 20, 1400);
+  ngtcp2_pmtud_blackhole_lost(&bh, 18, 1400);
+  assert_false(ngtcp2_pmtud_blackhole_detected(&bh));
+  assert_size(0, ==, bh.num_bursts);
+}
+
+void test_ngtcp2_pmtud_blackhole_old_ack(void) {
+  ngtcp2_pmtud_blackhole bh;
+  ngtcp2_pmtud_blackhole_init(&bh, 0);
+  ngtcp2_pmtud_blackhole_lost(&bh, 20, 1400);
+  assert_false(ngtcp2_pmtud_blackhole_detected(&bh));
+  ngtcp2_pmtud_blackhole_ack(&bh, 10, 1450);
+  assert_size(1, ==, bh.num_bursts);
+  ngtcp2_pmtud_blackhole_lost(&bh, 22, 1400);
+  assert_false(ngtcp2_pmtud_blackhole_detected(&bh));
+  assert_size(2, ==, bh.num_bursts);
+}
+
+void test_ngtcp2_pmtud_blackhole_epoch(void) {
+  ngtcp2_pmtud_blackhole bh;
+  int i;
+  ngtcp2_pmtud_blackhole_init(&bh, 100);
+  for (i = 0; i < 10; ++i) {
+    ngtcp2_pmtud_blackhole_lost(&bh, i, 1400);
+    ngtcp2_pmtud_blackhole_ack(&bh, i + 1, 1450);
+    assert_false(ngtcp2_pmtud_blackhole_detected(&bh));
+  }
+  assert_size(0, ==, bh.num_bursts);
+  assert_int64(-1, ==, bh.acked_pkt_num);
+}
+
+void test_ngtcp2_pmtud_blackhole_bounded(void) {
+  ngtcp2_pmtud_blackhole bh;
+  int64_t pn;
+  ngtcp2_pmtud_blackhole_init(&bh, 0);
+  for (pn = 2000; pn > 0; pn -= 2) {
+    ngtcp2_pmtud_blackhole_lost(&bh, pn, 1400);
+  }
+  assert_true(ngtcp2_pmtud_blackhole_detected(&bh));
+  assert_size(4, ==, bh.num_bursts);
+  ngtcp2_pmtud_blackhole_ack(&bh, 2001, 1400);
+  assert_false(ngtcp2_pmtud_blackhole_detected(&bh));
+}
+
+void test_ngtcp2_pmtud_blackhole_ordinary_loss(void) {
+  ngtcp2_pmtud_blackhole bh;
+  int i;
+  ngtcp2_pmtud_blackhole_init(&bh, 0);
+  for (i = 0; i < 1000; ++i) {
+    ngtcp2_pmtud_blackhole_lost(&bh, 2 * i, 1400);
+    assert_false(ngtcp2_pmtud_blackhole_detected(&bh));
+    ngtcp2_pmtud_blackhole_ack(&bh, 2 * i + 1, 1400);
+  }
+  assert_size(0, ==, bh.num_bursts);
 }

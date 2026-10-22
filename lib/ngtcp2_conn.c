@@ -1451,6 +1451,8 @@ static int conn_new(ngtcp2_conn **pconn, const ngtcp2_cid *dcid,
 
   ngtcp2_dcid_init(&(*pconn)->dcid.current, 0, dcid, NULL);
   ngtcp2_dcid_set_path(&(*pconn)->dcid.current, path);
+  ngtcp2_pmtud_blackhole_init(&(*pconn)->pmtud_recovery.blackhole, 0);
+  (*pconn)->pmtud_recovery.next_probe_ts = UINT64_MAX;
 
   assert((size_t)path->local.addrlen <= sizeof((*pconn)->hs_local_addr));
 
@@ -4675,6 +4677,11 @@ static ngtcp2_ssize conn_write_pkt(ngtcp2_conn *conn, ngtcp2_pkt_info *pi,
 
   ngtcp2_qlog_pkt_sent_end(&conn->qlog, hd, (size_t)nwrite);
 
+  if (type == NGTCP2_PKT_1RTT && dgram_offset == 0 &&
+      !(rtb_entry_flags & NGTCP2_RTB_ENTRY_FLAG_PMTUD_PROBE)) {
+    rtb_entry_flags |= NGTCP2_RTB_ENTRY_FLAG_PMTUD_DATA;
+  }
+
   /* TODO ack-eliciting vs needs-tracking */
   /* probe packet needs tracking but it does not need ACK, could be lost. */
   if ((rtb_entry_flags & NGTCP2_RTB_ENTRY_FLAG_ACK_ELICITING) || padded) {
@@ -4887,6 +4894,11 @@ ngtcp2_ssize ngtcp2_conn_write_single_frame_pkt(
     break;
   }
 
+  if (type == NGTCP2_PKT_1RTT &&
+      !(rtb_entry_flags & NGTCP2_RTB_ENTRY_FLAG_PMTUD_PROBE)) {
+    rtb_entry_flags |= NGTCP2_RTB_ENTRY_FLAG_PMTUD_DATA;
+  }
+
   if (((rtb_entry_flags & NGTCP2_RTB_ENTRY_FLAG_ACK_ELICITING) || padded) &&
       (!path || ngtcp2_path_eq(&conn->dcid.current.ps.path, path))) {
     if (pi && (conn->tx.ecn.state == NGTCP2_ECN_STATE_CAPABLE ||
@@ -5092,12 +5104,15 @@ static int conn_bind_dcid(ngtcp2_conn *conn, ngtcp2_dcid **pdcid,
                                  dcidtr_on_retire, conn);
 }
 
+static void conn_reset_pmtud_recovery(ngtcp2_conn *conn);
+
 static int conn_start_pmtud(ngtcp2_conn *conn) {
   int rv;
   size_t hard_max_udp_payload_size;
 
   assert(!conn->local.settings.no_pmtud);
   assert(!conn->pmtud);
+  conn->pmtud_recovery.next_probe_ts = UINT64_MAX;
   assert(conn_is_tls_handshake_completed(conn));
   assert(conn->remote.transport_params);
   assert(conn->remote.transport_params->max_udp_payload_size >=
@@ -5135,6 +5150,131 @@ void ngtcp2_conn_stop_pmtud(ngtcp2_conn *conn) {
   ngtcp2_pmtud_del(conn->pmtud);
 
   conn->pmtud = NULL;
+}
+
+
+static int conn_pmtud_recovery_enabled(const ngtcp2_conn *conn) {
+  return (conn->flags & NGTCP2_CONN_FLAG_HANDSHAKE_CONFIRMED) &&
+         (conn->dcid.current.flags & NGTCP2_DCID_FLAG_PATH_VALIDATED) &&
+         !conn->local.settings.no_pmtud &&
+         !conn->local.settings.no_tx_udp_payload_size_shaping;
+}
+
+static ngtcp2_tstamp conn_pmtud_deadline(ngtcp2_tstamp ts,
+                                        ngtcp2_duration delay) {
+  return ts >= UINT64_MAX - delay ? UINT64_MAX : ts + delay;
+}
+
+/* Called after replacing the active path, including port-only rebinding.
+   Already sent packet numbers cannot supply evidence for the new path. */
+static void conn_reset_pmtud_recovery(ngtcp2_conn *conn) {
+  ngtcp2_conn_stop_pmtud(conn);
+  ngtcp2_pmtud_blackhole_init(&conn->pmtud_recovery.blackhole,
+                              conn->pktns.tx.last_pkt_num + 1);
+  conn->pmtud_recovery.next_probe_ts = UINT64_MAX;
+  conn->pmtud_recovery.awaiting_ack = 0;
+}
+
+/* A failed upward probe does not invalidate the working path size. PTO
+   fallback needs a real outstanding, oversized, ack-eliciting data packet. */
+static int conn_pmtud_has_unacked_large_pkt(ngtcp2_conn *conn) {
+  ngtcp2_ksl_it it;
+  ngtcp2_rtb_entry *ent;
+
+  for (it = ngtcp2_rtb_head(&conn->pktns.rtb); !ngtcp2_ksl_it_end(&it);
+       ngtcp2_ksl_it_next(&it)) {
+    ent = ngtcp2_ksl_it_get(&it);
+    if (ent->hd.pkt_num < conn->pmtud_recovery.blackhole.min_pkt_num) {
+      break;
+    }
+    if ((ent->flags & NGTCP2_RTB_ENTRY_FLAG_PMTUD_DATA) &&
+        (ent->flags & NGTCP2_RTB_ENTRY_FLAG_ACK_ELICITING) &&
+        !(ent->flags & (NGTCP2_RTB_ENTRY_FLAG_PMTUD_PROBE |
+                        NGTCP2_RTB_ENTRY_FLAG_LOST_RETRANSMITTED |
+                        NGTCP2_RTB_ENTRY_FLAG_SKIP)) &&
+        ent->pktlen > NGTCP2_MAX_UDP_PAYLOAD_SIZE) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static void conn_pmtud_fallback(ngtcp2_conn *conn, ngtcp2_tstamp ts) {
+  if (!conn_pmtud_recovery_enabled(conn) ||
+      conn->dcid.current.max_udp_payload_size <= NGTCP2_MAX_UDP_PAYLOAD_SIZE) {
+    return;
+  }
+
+  ngtcp2_conn_stop_pmtud(conn);
+  conn->dcid.current.max_udp_payload_size = NGTCP2_MAX_UDP_PAYLOAD_SIZE;
+  conn->cstat.max_tx_udp_payload_size =
+    ngtcp2_conn_get_path_max_tx_udp_payload_size2(conn);
+  ngtcp2_pmtud_blackhole_init(&conn->pmtud_recovery.blackhole,
+                              conn->pktns.tx.last_pkt_num + 1);
+  conn->pmtud_recovery.awaiting_ack = 1;
+  conn->pmtud_recovery.next_probe_ts =
+    conn_pmtud_deadline(ts, NGTCP2_PMTUD_BLACKHOLE_COOLDOWN);
+  ngtcp2_log_info(&conn->log, NGTCP2_LOG_EVENT_LDC,
+                  "PMTUD provisional fallback to base payload");
+}
+
+void ngtcp2_conn_pmtud_on_ack(ngtcp2_conn *conn,
+                              const ngtcp2_rtb_entry *ent,
+                              ngtcp2_tstamp ts) {
+  (void)ts;
+  if (!conn_pmtud_recovery_enabled(conn) ||
+      !(ent->flags & (NGTCP2_RTB_ENTRY_FLAG_PMTUD_DATA |
+                      NGTCP2_RTB_ENTRY_FLAG_PMTUD_PROBE)) ||
+      ent->hd.pkt_num < conn->pmtud_recovery.blackhole.min_pkt_num) {
+    return;
+  }
+
+  ngtcp2_pmtud_blackhole_ack(&conn->pmtud_recovery.blackhole,
+                             ent->hd.pkt_num, ent->pktlen);
+  if (conn->pmtud_recovery.awaiting_ack &&
+      ent->pktlen <= NGTCP2_MAX_UDP_PAYLOAD_SIZE) {
+    conn->pmtud_recovery.awaiting_ack = 0;
+  }
+}
+
+void ngtcp2_conn_pmtud_on_lost(ngtcp2_conn *conn,
+                               const ngtcp2_rtb_entry *ent) {
+  if (!conn_pmtud_recovery_enabled(conn) ||
+      !(ent->flags & NGTCP2_RTB_ENTRY_FLAG_PMTUD_DATA) ||
+      (ent->flags & NGTCP2_RTB_ENTRY_FLAG_PMTUD_PROBE)) {
+    return;
+  }
+  ngtcp2_pmtud_blackhole_lost(&conn->pmtud_recovery.blackhole,
+                              ent->hd.pkt_num, ent->pktlen);
+}
+
+void ngtcp2_conn_pmtud_check_blackhole(ngtcp2_conn *conn,
+                                       ngtcp2_tstamp ts) {
+  if (conn_pmtud_recovery_enabled(conn) &&
+      ngtcp2_pmtud_blackhole_detected(&conn->pmtud_recovery.blackhole)) {
+    conn_pmtud_fallback(conn, ts);
+  }
+}
+
+void ngtcp2_conn_pmtud_completed(ngtcp2_conn *conn, ngtcp2_tstamp ts) {
+  ngtcp2_conn_stop_pmtud(conn);
+  if (conn_pmtud_recovery_enabled(conn)) {
+    conn->pmtud_recovery.next_probe_ts =
+      conn_pmtud_deadline(ts, NGTCP2_PMTUD_RAISE_INTERVAL);
+  }
+}
+
+static int conn_poll_pmtud(ngtcp2_conn *conn, ngtcp2_tstamp ts) {
+  if (!conn_pmtud_recovery_enabled(conn) || conn->pmtud ||
+      conn->pmtud_recovery.awaiting_ack ||
+      conn->pmtud_recovery.next_probe_ts == UINT64_MAX ||
+      ts < conn->pmtud_recovery.next_probe_ts) {
+    return 0;
+  }
+
+  /* Ordinary sends drive re-search, preserving the existing congestion,
+     pacing, amplification and output-buffer checks for actual probes. */
+  return conn_start_pmtud(conn);
 }
 
 static ngtcp2_ssize conn_write_pmtud_probe(ngtcp2_conn *conn,
@@ -5311,6 +5451,7 @@ static int conn_on_path_validation_failed(ngtcp2_conn *conn, ngtcp2_pv *pv,
 
   if (pv->flags & NGTCP2_PV_FLAG_FALLBACK_PRESENT) {
     ngtcp2_dcid_copy(&conn->dcid.current, &pv->fallback_dcid);
+    conn_reset_pmtud_recovery(conn);
     conn_reset_congestion_state(conn, ts);
   }
 
@@ -6350,6 +6491,7 @@ static int conn_recv_path_response(ngtcp2_conn *conn, ngtcp2_path_response *fr,
       }
 
       ngtcp2_dcid_copy(&conn->dcid.current, &pv->dcid);
+      conn_reset_pmtud_recovery(conn);
 
       conn_reset_congestion_state(conn, ts);
       conn_reset_ecn_validation_state(conn);
@@ -8997,6 +9139,7 @@ static int conn_revert_client_migration(ngtcp2_conn *conn,
                   "path is migrated back to the original path");
 
   ngtcp2_dcid_copy(&conn->dcid.current, dcid);
+  conn_reset_pmtud_recovery(conn);
   conn_reset_congestion_state(conn, ts);
   conn->dcid.current.bytes_recv += dgramlen;
   conn_reset_ecn_validation_state(conn);
@@ -9216,6 +9359,7 @@ static int conn_recv_non_probing_pkt_on_new_path(ngtcp2_conn *conn,
     }
 
     ngtcp2_dcid_copy(&conn->dcid.current, &dcid);
+    conn_reset_pmtud_recovery(conn);
 
     if (!local_addr_eq || (remote_addr_cmp & (NGTCP2_ADDR_CMP_FLAG_ADDR |
                                               NGTCP2_ADDR_CMP_FLAG_FAMILY))) {
@@ -11683,7 +11827,7 @@ int ngtcp2_conn_handle_expiry(ngtcp2_conn *conn, ngtcp2_tstamp ts) {
   if (conn->pmtud) {
     ngtcp2_pmtud_handle_expiry(conn->pmtud, ts);
     if (ngtcp2_pmtud_finished(conn->pmtud)) {
-      ngtcp2_conn_stop_pmtud(conn);
+      ngtcp2_conn_pmtud_completed(conn, ts);
     }
   }
 
@@ -12573,6 +12717,12 @@ ngtcp2_ssize ngtcp2_conn_write_vmsg(ngtcp2_conn *conn, ngtcp2_path *path,
   (void)pkt_info_version;
 
   conn_update_timestamp(conn, ts);
+  if (!ppe_pending && conn->state == NGTCP2_CS_POST_HANDSHAKE) {
+    rv = conn_poll_pmtud(conn, ts);
+    if (rv != 0) {
+      return rv;
+    }
+  }
 
   if (path) {
     ngtcp2_path_copy(path, &conn->dcid.current.ps.path);
@@ -13816,6 +13966,15 @@ int ngtcp2_conn_on_loss_detection_timer(ngtcp2_conn *conn, ngtcp2_tstamp ts) {
   ++cstat->pto_count;
   cstat->pto_count = ngtcp2_min(cstat->pto_count, 30);
 
+  /* Complete silence supplies no ACK-driven loss rounds. Preserve a
+     bounded conservative fallback without declaring old packets lost or
+     resetting congestion/PTO state. Re-search requires new small-packet ACKs. */
+  if (cstat->pto_count >= 3 && conn_pmtud_recovery_enabled(conn) &&
+      conn->dcid.current.max_udp_payload_size > NGTCP2_MAX_UDP_PAYLOAD_SIZE &&
+      conn_pmtud_has_unacked_large_pkt(conn)) {
+    conn_pmtud_fallback(conn, ts);
+  }
+
   ngtcp2_log_infof(&conn->log, NGTCP2_LOG_EVENT_LDC,
                    "pto_count=", cstat->pto_count);
 
@@ -14203,6 +14362,7 @@ int ngtcp2_conn_initiate_immediate_migration(ngtcp2_conn *conn,
   }
 
   ngtcp2_dcid_copy(&conn->dcid.current, &dcid);
+  conn_reset_pmtud_recovery(conn);
 
   /* Restore the maximum UDP payload size of the validated path
      before resetting congestion state because it derives its

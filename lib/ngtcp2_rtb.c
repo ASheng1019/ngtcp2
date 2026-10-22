@@ -475,6 +475,8 @@ static int rtb_on_pkt_lost(ngtcp2_rtb *rtb, ngtcp2_rtb_entry *ent,
   ngtcp2_cc *cc = rtb->cc;
   ngtcp2_cc_pkt pkt;
 
+  ngtcp2_conn_pmtud_on_lost(conn, ent);
+
   if (!(ent->flags & NGTCP2_RTB_ENTRY_FLAG_SKIP)) {
     ngtcp2_log_pkt_lost(rtb->log, ent->hd.pkt_num, ent->hd.type, ent->hd.flags,
                         ent->ts);
@@ -605,13 +607,15 @@ static void conn_ack_crypto_data(ngtcp2_conn *conn, ngtcp2_pktns *pktns,
 }
 
 static int process_acked_pkt(ngtcp2_rtb_entry *ent, ngtcp2_conn *conn,
-                             ngtcp2_pktns *pktns) {
+                             ngtcp2_pktns *pktns, ngtcp2_tstamp ts) {
   ngtcp2_frame_chain *frc;
   uint64_t prev_stream_offset, stream_offset;
   ngtcp2_strm *strm;
   int rv;
   uint64_t datalen;
   ngtcp2_strm *crypto = &pktns->crypto.strm;
+
+  ngtcp2_conn_pmtud_on_ack(conn, ent, ts);
 
   if ((ent->flags & NGTCP2_RTB_ENTRY_FLAG_PMTUD_PROBE) && conn->pmtud &&
       conn->pmtud->tx_pkt_num <= ent->hd.pkt_num) {
@@ -624,7 +628,7 @@ static int process_acked_pkt(ngtcp2_rtb_entry *ent, ngtcp2_conn *conn,
     }
 
     if (ngtcp2_pmtud_finished(conn->pmtud)) {
-      ngtcp2_conn_stop_pmtud(conn);
+      ngtcp2_conn_pmtud_completed(conn, ts);
     }
   }
 
@@ -943,7 +947,7 @@ ngtcp2_ssize ngtcp2_rtb_recv_ack(ngtcp2_rtb *rtb, const ngtcp2_ack *fr,
         ++ecn_acked;
       }
 
-      rv = process_acked_pkt(ent, conn, pktns);
+      rv = process_acked_pkt(ent, conn, pktns, ts);
       if (rv != 0) {
         goto fail;
       }
@@ -1221,6 +1225,8 @@ static int rtb_detect_lost_pkt(ngtcp2_rtb *rtb, ngtcp2_cc_ack *cc_ack,
       break;
     }
   }
+
+  ngtcp2_conn_pmtud_check_blackhole(conn, ts);
 
   ngtcp2_rtb_remove_excessive_lost_pkt(rtb, (size_t)pkt_thres, cstat, ts);
 

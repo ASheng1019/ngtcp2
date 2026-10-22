@@ -31,6 +31,46 @@
 
 #include <ngtcp2/ngtcp2.h>
 
+/* Recovery policy inspired by Quinn's loss-burst detector.  Packet numbers
+   arrive in decreasing order from ngtcp2's retransmission buffer. */
+#define NGTCP2_PMTUD_BLACKHOLE_THRESHOLD 3
+#define NGTCP2_PMTUD_BLACKHOLE_COOLDOWN (60 * NGTCP2_SECONDS)
+#define NGTCP2_PMTUD_RAISE_INTERVAL (600 * NGTCP2_SECONDS)
+
+typedef struct ngtcp2_pmtud_loss_burst {
+  int64_t last_pkt_num;
+  size_t smallest_payload;
+} ngtcp2_pmtud_loss_burst;
+
+typedef struct ngtcp2_pmtud_blackhole {
+  ngtcp2_pmtud_loss_burst bursts[NGTCP2_PMTUD_BLACKHOLE_THRESHOLD + 1];
+  size_t num_bursts;
+  /* Ignore feedback preceding this path/recovery generation. */
+  int64_t min_pkt_num;
+  int64_t acked_pkt_num;
+  size_t acked_payload;
+  int64_t burst_first_pkt_num;
+  int64_t burst_last_pkt_num;
+  size_t burst_smallest_payload;
+} ngtcp2_pmtud_blackhole;
+
+typedef struct ngtcp2_pmtud_recovery {
+  ngtcp2_pmtud_blackhole blackhole;
+  /* Lazy deadline: checked on a send, never wakes an idle connection. */
+  ngtcp2_tstamp next_probe_ts;
+  /* Re-search requires fresh ACK progress after the provisional fallback. */
+  int awaiting_ack;
+} ngtcp2_pmtud_recovery;
+
+void ngtcp2_pmtud_blackhole_init(ngtcp2_pmtud_blackhole *bh,
+                                 int64_t min_pkt_num);
+void ngtcp2_pmtud_blackhole_ack(ngtcp2_pmtud_blackhole *bh, int64_t pkt_num,
+                                size_t payloadlen);
+void ngtcp2_pmtud_blackhole_lost(ngtcp2_pmtud_blackhole *bh, int64_t pkt_num,
+                                 size_t payloadlen);
+/* End one loss-detection round. A contiguous run counts only once. */
+int ngtcp2_pmtud_blackhole_detected(ngtcp2_pmtud_blackhole *bh);
+
 typedef struct ngtcp2_pmtud {
   const ngtcp2_mem *mem;
   /* mtu_idx is the index of UDP payload size candidates to try
